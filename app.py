@@ -248,21 +248,21 @@ if st.button("Load/Refresh Data"):
 if st.session_state.data_loaded:
     data = st.session_state.data
     # Apply filters
-    required_pass = int(np.ceil(pass_ratio * data['Years']))
-    # We need to check each criterion for each row
-    passing = data[
-        (data['Years'] >= min_years) &
-        (data['Avg Gross Margin (%)'] > gross_margin_min) &
-        (data['Avg Op Margin (%)'] > op_margin_min) &
-        (data['ROE Pass Count'] >= required_pass) &
-        (data['D/E Pass Count'] >= required_pass) &
-        (data['FCF Positive Count'] >= required_pass) &
-        (data['Rev Growth Positive Count'] >= required_pass) &
-        (data['P/E'] > 0) & (data['P/E'] < pe_max) &
-        (data['P/B'] < pb_max) &
-        (data['P/FCF'] < pfcf_max) &
-        (data['Market Cap ($B)'] > market_cap_min)
-    ]
+# 不再需要 required_pass 变量，直接在筛选条件中逐行比较
+passing = data[
+    (data['Years'] >= min_years) &
+    (data['Avg Gross Margin (%)'] > gross_margin_min) &
+    (data['Avg Op Margin (%)'] > op_margin_min) &
+    (data['Avg ROE (%)'] > roe_min) &
+    (data['Avg Debt/Equity'] < de_max) &
+    # 用 pass_ratio 乘以每只股票的年数，并向上取整，再与达标年数比较
+    (data['FCF Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
+    (data['Rev Growth Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
+    (data['P/E'] > 0) & (data['P/E'] < pe_max) &
+    (data['P/B'] < pb_max) &
+    (data['P/FCF'] < pfcf_max) &
+    (data['Market Cap ($B)'] > market_cap_min)
+]
     # Also require ROE > threshold in enough years (already via ROE Pass Count using hardcoded 15? We need to use roe_min)
     # The precomputed ROE Pass Count was using 15% fixed. That's not correct for dynamic threshold.
     # We'll need to compute ROE pass count based on roe_min. We could store the raw yearly ROE values, but that's heavy.
