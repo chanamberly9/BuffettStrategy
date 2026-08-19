@@ -167,10 +167,12 @@ def load_all_data(tickers):
                     'Rev Growth Positive Count': (df['Revenue Growth (%)'] > 0).sum(),
                     'Latest FCF': df.iloc[-1]['FCF'],
                 }
-                # Get valuation
+                # Get company name and valuation
                 t = yf.Ticker(sym)
+                name = sym  # fallback to ticker
                 try:
                     info = t.info
+                    name = info.get('longName') or info.get('shortName') or sym
                     price = info.get('currentPrice') or info.get('regularMarketPrice')
                     shares = info.get('sharesOutstanding')
                     market_cap = info.get('marketCap')
@@ -186,10 +188,12 @@ def load_all_data(tickers):
                         summary['P/FCF'] = np.nan
                     summary['Market Cap ($B)'] = market_cap / 1e9 if pd.notna(market_cap) else np.nan
                 except:
+                    # If info fails, keep name as ticker and set valuation to NaN
                     summary['P/E'] = np.nan
                     summary['P/B'] = np.nan
                     summary['P/FCF'] = np.nan
                     summary['Market Cap ($B)'] = np.nan
+                summary['Name'] = name   # add company name
                 summaries.append(summary)
             else:
                 failed.append(sym)
@@ -265,7 +269,8 @@ if st.session_state.data_loaded:
 
     st.subheader(f"Results: {len(passing)} passing stocks")
     if not passing.empty:
-        display_cols = ['Ticker', 'Years', 'Avg ROE (%)', 'Avg Gross Margin (%)',
+        # Include 'Name' in the display
+        display_cols = ['Ticker', 'Name', 'Years', 'Avg ROE (%)', 'Avg Gross Margin (%)',
                         'Avg Op Margin (%)', 'Avg Debt/Equity', 'P/E', 'P/B', 'P/FCF', 'Market Cap ($B)']
         st.dataframe(passing[display_cols].reset_index(drop=True), use_container_width=True)
 
