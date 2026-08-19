@@ -6,6 +6,7 @@ import requests
 import io
 import time
 import warnings
+from scipy.optimize import minimize
 warnings.filterwarnings('ignore')
 
 # ------------------------------------------------------------
@@ -188,12 +189,11 @@ def load_all_data(tickers):
                         summary['P/FCF'] = np.nan
                     summary['Market Cap ($B)'] = market_cap / 1e9 if pd.notna(market_cap) else np.nan
                 except:
-                    # If info fails, keep name as ticker and set valuation to NaN
                     summary['P/E'] = np.nan
                     summary['P/B'] = np.nan
                     summary['P/FCF'] = np.nan
                     summary['Market Cap ($B)'] = np.nan
-                summary['Name'] = name   # add company name
+                summary['Name'] = name
                 summaries.append(summary)
             else:
                 failed.append(sym)
@@ -207,6 +207,81 @@ def load_all_data(tickers):
     if failed:
         st.warning(f"Failed to retrieve data for {len(failed)} tickers.")
     return pd.DataFrame(summaries)
+
+# ------------------------------------------------------------
+# Portfolio optimization functions
+# ------------------------------------------------------------
+@st.cache_data(ttl=3600)
+def fetch_historical_prices(tickers, period="5y"):
+    """Fetch adjusted close prices for given tickers."""
+    data = yf.download(tickers, period=period, group_by='ticker', auto_adjust=True, progress=False)
+    # If only one ticker, adjust format
+    if len(tickers) == 1:
+        prices = data['Close'] if 'Close' in data else data
+    else:
+        prices = pd.DataFrame({ticker: data[ticker]['Close'] for ticker in tickers if ticker in data.columns})
+    return prices
+
+def portfolio_stats(weights, mean_returns, cov_matrix):
+    """Compute expected return, volatility, and Sharpe ratio."""
+    ret = np.sum(mean_returns * weights) * 252   # annualized
+    vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))  # annualized
+    return ret, vol
+
+def tangency_portfolio(mean_returns, cov_matrix, risk_free_rate=0.02):
+    """Compute tangency (maximum Sharpe) portfolio weights."""
+    n = len(mean_returns)
+    inv_cov = np.linalg.pinv(cov_matrix)  # use pseudo-inverse for stability
+    ones = np.ones(n)
+    mu_minus_rf = mean_returns - risk_free_rate
+    numerator = inv_cov @ mu_minus_rf
+    denominator = ones @ numerator
+    if denominator == 0:
+        return None
+    weights = numerator / denominator
+    # Clip small negative weights to zero and renormalize? 
+    # We'll allow short sales? Better to constrain to long-only.
+    # We'll use a constrained optimization for long-only to be safe.
+    # Since we want long-only, we'll use scipy minimize with bounds.
+    # Use the analytical solution as initial guess.
+    return weights
+
+def optimize_portfolio(tickers, risk_free_rate=0.02, period="5y"):
+    """
+    Fetch historical data, compute mean returns and covariance, 
+    and return tangency portfolio weights and stats.
+    """
+    prices = fetch_historical_prices(tickers, period)
+    if prices.empty or len(prices) < 2:
+        return None, None, None
+    
+    # Compute daily returns
+    returns = prices.pct_change().dropna()
+    if returns.shape[0] < 10:
+        return None, None, None
+    
+    mean_returns = returns.mean().values
+    cov_matrix = returns.cov().values
+    
+    # Use scipy optimize for long-only tangency portfolio
+    n = len(tickers)
+    # Objective: minimize negative Sharpe (or maximize Sharpe)
+    def neg_sharpe(w):
+        ret = np.sum(mean_returns * w) * 252
+        vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix * 252, w)))
+        sharpe = (ret - risk_free_rate) / vol if vol > 0 else 0
+        return -sharpe
+    
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0, 1) for _ in range(n))
+    initial = np.ones(n) / n
+    result = minimize(neg_sharpe, initial, method='SLSQP', bounds=bounds, constraints=constraints)
+    if not result.success:
+        return None, None, None
+    weights = result.x
+    ret_ann, vol_ann = portfolio_stats(weights, mean_returns, cov_matrix)
+    sharpe = (ret_ann - risk_free_rate) / vol_ann if vol_ann > 0 else np.nan
+    return weights, ret_ann, vol_ann, sharpe
 
 # ------------------------------------------------------------
 # Sidebar parameters
@@ -231,6 +306,14 @@ pfcf_max = st.sidebar.slider("P/FCF maximum", 5, 100, 40, 1)
 market_cap_min = st.sidebar.number_input("Minimum Market Cap ($B)", value=10.0, step=1.0)
 
 # ------------------------------------------------------------
+# Portfolio optimization UI settings (in sidebar)
+# ------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Portfolio Optimization")
+risk_free_rate = st.sidebar.number_input("Risk‑free rate (annual, %)", value=2.0, step=0.1) / 100
+period_opt = st.sidebar.selectbox("Historical data period", ["1y", "2y", "3y", "5y", "10y"], index=3)
+
+# ------------------------------------------------------------
 # Main logic
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
@@ -252,7 +335,7 @@ if st.button("Load/Refresh Data"):
 if st.session_state.data_loaded:
     data = st.session_state.data
 
-    # Apply filters – each stock's required pass count is computed individually
+    # Apply filters
     passing = data[
         (data['Years'] >= min_years) &
         (data['Avg Gross Margin (%)'] > gross_margin_min) &
@@ -269,7 +352,6 @@ if st.session_state.data_loaded:
 
     st.subheader(f"Results: {len(passing)} passing stocks")
     if not passing.empty:
-        # Include 'Name' in the display
         display_cols = ['Ticker', 'Name', 'Years', 'Avg ROE (%)', 'Avg Gross Margin (%)',
                         'Avg Op Margin (%)', 'Avg Debt/Equity', 'P/E', 'P/B', 'P/FCF', 'Market Cap ($B)']
         st.dataframe(passing[display_cols].reset_index(drop=True), use_container_width=True)
@@ -281,6 +363,84 @@ if st.session_state.data_loaded:
             file_name='buffett_screen_results.csv',
             mime='text/csv',
         )
+
+        # ------------------------------------------------------------
+        # Portfolio Builder Section
+        # ------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("📊 Build Optimal Risky Portfolio from Passing Stocks")
+        st.markdown("Select stocks from the list below to construct the tangency portfolio (maximum Sharpe ratio).")
+
+        # Get list of tickers and names
+        ticker_list = passing['Ticker'].tolist()
+        name_list = passing['Name'].tolist()
+        options = [f"{ticker} - {name}" for ticker, name in zip(ticker_list, name_list)]
+        default_selection = options[:min(10, len(options))]  # default to first 10
+
+        selected_options = st.multiselect("Choose stocks for portfolio (at least 2)", options, default=default_selection)
+        selected_tickers = [opt.split(" - ")[0] for opt in selected_options]
+
+        if len(selected_tickers) < 2:
+            st.warning("Please select at least 2 stocks.")
+        else:
+            if st.button("Optimize Portfolio"):
+                with st.spinner("Fetching historical data and optimizing..."):
+                    weights, ret, vol, sharpe = optimize_portfolio(selected_tickers, risk_free_rate, period_opt)
+                    if weights is not None:
+                        # Create results DataFrame
+                        weight_df = pd.DataFrame({
+                            'Ticker': selected_tickers,
+                            'Weight (%)': weights * 100
+                        })
+                        # Add company names if available
+                        name_map = {ticker: name for ticker, name in zip(ticker_list, name_list)}
+                        weight_df['Name'] = weight_df['Ticker'].map(name_map)
+                        weight_df = weight_df[weight_df['Weight (%)'] > 0.01]  # drop near-zero weights
+                        weight_df = weight_df.sort_values('Weight (%)', ascending=False).reset_index(drop=True)
+
+                        st.success("Portfolio optimized!")
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Expected Annual Return", f"{ret*100:.2f}%")
+                        col2.metric("Annual Volatility", f"{vol*100:.2f}%")
+                        col3.metric("Sharpe Ratio", f"{sharpe:.3f}")
+                        col4.metric("Number of Stocks", len(weight_df))
+
+                        # Display weights
+                        st.subheader("Optimal Weights")
+                        st.dataframe(weight_df.style.format({'Weight (%)': '{:.2f}'}), use_container_width=True)
+
+                        # Simple pie chart using st.bar_chart? But better to use plotly if available.
+                        # We'll use a simple bar chart.
+                        st.subheader("Weight Distribution")
+                        st.bar_chart(weight_df.set_index('Ticker')['Weight (%)'])
+
+                        # Description
+                        st.subheader("📝 Portfolio Description")
+                        desc = f"""
+                        This **optimal risky portfolio** (tangency portfolio) is constructed from the {len(weight_df)} stocks 
+                        that passed your Buffett‑style filters. Using historical returns over the past **{period_opt}**, 
+                        it maximizes the Sharpe ratio given a risk‑free rate of **{risk_free_rate*100:.2f}%**.
+                        
+                        - **Expected annual return:** {ret*100:.2f}%  
+                        - **Annual volatility (risk):** {vol*100:.2f}%  
+                        - **Sharpe ratio:** {sharpe:.3f}  
+                        
+                        The portfolio is well‑diversified across the selected stocks, with the largest allocation to 
+                        **{weight_df.iloc[0]['Name']} ({weight_df.iloc[0]['Weight (%)']:.2f}%)** 
+                        and the smallest to **{weight_df.iloc[-1]['Name']} ({weight_df.iloc[-1]['Weight (%)']:.2f}%)**.
+                        """
+                        st.markdown(desc)
+
+                        # Download portfolio weights CSV
+                        csv_port = weight_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="Download portfolio weights as CSV",
+                            data=csv_port,
+                            file_name='optimal_portfolio_weights.csv',
+                            mime='text/csv',
+                        )
+                    else:
+                        st.error("Optimization failed. Try selecting a longer history period or a different set of stocks.")
     else:
         st.info("No stocks match the current criteria. Try relaxing the filters.")
 else:
