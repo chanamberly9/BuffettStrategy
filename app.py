@@ -247,42 +247,16 @@ if st.button("Load/Refresh Data"):
 
 if st.session_state.data_loaded:
     data = st.session_state.data
-    # Apply filters
-# 不再需要 required_pass 变量，直接在筛选条件中逐行比较
-passing = data[
-    (data['Years'] >= min_years) &
-    (data['Avg Gross Margin (%)'] > gross_margin_min) &
-    (data['Avg Op Margin (%)'] > op_margin_min) &
-    (data['Avg ROE (%)'] > roe_min) &
-    (data['Avg Debt/Equity'] < de_max) &
-    # 用 pass_ratio 乘以每只股票的年数，并向上取整，再与达标年数比较
-    (data['FCF Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
-    (data['Rev Growth Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
-    (data['P/E'] > 0) & (data['P/E'] < pe_max) &
-    (data['P/B'] < pb_max) &
-    (data['P/FCF'] < pfcf_max) &
-    (data['Market Cap ($B)'] > market_cap_min)
-]
-    # Also require ROE > threshold in enough years (already via ROE Pass Count using hardcoded 15? We need to use roe_min)
-    # The precomputed ROE Pass Count was using 15% fixed. That's not correct for dynamic threshold.
-    # We'll need to compute ROE pass count based on roe_min. We could store the raw yearly ROE values, but that's heavy.
-    # Simpler: recompute based on stored counts? We stored ROE Pass Count for 15% only.
-    # To keep it simple, we'll ignore the dynamic roe threshold for yearly counts and use average ROE instead.
-    # Alternatively, we can store the full yearly data in session and recompute on the fly, but that's memory heavy.
-    # For now, we'll use Avg ROE as a proxy, and also apply a yearly threshold using stored ROE Pass Count? Not possible.
-    # We'll adjust: we can store the raw ROE values for each ticker as a list, but that's not cached efficiently.
-    # Instead, we'll change the approach: precompute average ROE and also count years where ROE > 15, but we need dynamic.
-    # We'll modify the load function to store a list of ROE values? But Streamlit caching can handle lists.
-    # To keep the app simple, we'll add an "Avg ROE" filter instead of a yearly threshold. 
-    # So we'll remove the ROE Pass Count requirement and use Avg ROE > roe_min.
+
+    # Apply filters – each stock's required pass count is computed individually
     passing = data[
         (data['Years'] >= min_years) &
         (data['Avg Gross Margin (%)'] > gross_margin_min) &
         (data['Avg Op Margin (%)'] > op_margin_min) &
         (data['Avg ROE (%)'] > roe_min) &
         (data['Avg Debt/Equity'] < de_max) &
-        (data['FCF Positive Count'] >= required_pass) &
-        (data['Rev Growth Positive Count'] >= required_pass) &
+        (data['FCF Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
+        (data['Rev Growth Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
         (data['P/E'] > 0) & (data['P/E'] < pe_max) &
         (data['P/B'] < pb_max) &
         (data['P/FCF'] < pfcf_max) &
@@ -295,7 +269,6 @@ passing = data[
                         'Avg Op Margin (%)', 'Avg Debt/Equity', 'P/E', 'P/B', 'P/FCF', 'Market Cap ($B)']
         st.dataframe(passing[display_cols].reset_index(drop=True), use_container_width=True)
 
-        # Download button
         csv = passing[display_cols].to_csv(index=False).encode('utf-8')
         st.download_button(
             label="Download results as CSV",
