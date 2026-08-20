@@ -50,13 +50,13 @@ def get_sp500_tickers():
     return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'JNJ', 'V', 'PG', 'UNH', 'KO']
 
 # ------------------------------------------------------------
-# Data fetching and metric computation (with optional cutoff date)
+# Data fetching and metric computation (with robust date handling)
 # ------------------------------------------------------------
-def get_metrics_for_ticker(ticker_symbol, cutoff_date=None):
+def get_metrics_for_ticker(ticker_symbol, cutoff_date=None, min_years=3):
     """
     Download financial statements and compute per‑year metrics.
     If cutoff_date is given, only include fiscal years ending <= cutoff_date.
-    Returns DataFrame of yearly metrics or None if insufficient.
+    Returns DataFrame of yearly metrics or None if insufficient years.
     """
     ticker = yf.Ticker(ticker_symbol)
     try:
@@ -68,36 +68,47 @@ def get_metrics_for_ticker(ticker_symbol, cutoff_date=None):
     except:
         return None
 
-    # Filter columns by cutoff_date if provided
+    # Filter columns by cutoff_date (coerce errors, skip unparseable)
     def filter_by_cutoff(df, cutoff):
         if cutoff is None:
             return df
         cutoff = pd.to_datetime(cutoff)
-        keep_cols = [col for col in df.columns if pd.to_datetime(col) <= cutoff]
+        keep_cols = []
+        for col in df.columns:
+            try:
+                dt = pd.to_datetime(col)
+                if dt <= cutoff:
+                    keep_cols.append(col)
+            except:
+                # If column cannot be parsed as date, keep it (fallback)
+                keep_cols.append(col)
         return df[keep_cols]
 
     income = filter_by_cutoff(income, cutoff_date)
     balance = filter_by_cutoff(balance, cutoff_date)
     cashflow = filter_by_cutoff(cashflow, cutoff_date)
 
+    # If after filtering any table is empty, return None
     if income.empty or balance.empty or cashflow.empty:
         return None
 
-    # Map fiscal year to column
     def year_map(df):
         mapping = {}
         for col in df.columns:
-            dt = pd.to_datetime(col)
-            year = dt.year
-            if year not in mapping:
-                mapping[year] = col
+            try:
+                dt = pd.to_datetime(col)
+                year = dt.year
+                if year not in mapping:
+                    mapping[year] = col
+            except:
+                continue
         return mapping
 
     income_years = year_map(income)
     balance_years = year_map(balance)
     cashflow_years = year_map(cashflow)
     common_years = sorted(set(income_years) & set(balance_years) & set(cashflow_years))
-    if len(common_years) < 4:   # need at least 4 years for screening
+    if len(common_years) < min_years:
         return None
 
     rows = []
@@ -154,10 +165,10 @@ def get_metrics_for_ticker(ticker_symbol, cutoff_date=None):
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=3600*24, show_spinner=False)
-def load_all_data_as_of(cutoff_date, tickers):
+def load_all_data_as_of(cutoff_date, tickers, min_years=3):
     """
     Load fundamentals for all tickers, but only use financial statement dates <= cutoff_date.
-    Returns DataFrame with summary metrics for stocks that have at least 4 years of data.
+    Returns DataFrame with summary metrics for stocks that have at least min_years of data.
     """
     summaries = []
     failed = []
@@ -165,8 +176,8 @@ def load_all_data_as_of(cutoff_date, tickers):
     progress_bar = st.progress(0, text=f"Loading data as of {cutoff_date.strftime('%Y-%m-%d')}...")
     for i, sym in enumerate(tickers):
         try:
-            df = get_metrics_for_ticker(sym, cutoff_date)
-            if df is not None and len(df) >= 4:
+            df = get_metrics_for_ticker(sym, cutoff_date, min_years)
+            if df is not None and len(df) >= min_years:
                 # Compute summary metrics
                 summary = {
                     'Ticker': sym,
@@ -181,7 +192,7 @@ def load_all_data_as_of(cutoff_date, tickers):
                     'Rev Growth Positive Count': (df['Revenue Growth (%)'] > 0).sum(),
                     'Latest FCF': df.iloc[-1]['FCF'],
                 }
-                # Get company name and valuation (using info as of today, but we keep it as proxy)
+                # Get company name and valuation (using latest available info from yfinance)
                 t = yf.Ticker(sym)
                 name = sym
                 try:
@@ -296,7 +307,7 @@ def optimize_portfolio_with_history(tickers, end_date, risk_free_rate=0.02, look
 # ------------------------------------------------------------
 def track_portfolio_performance(tickers, weights, start_date, end_date=None, benchmark='SPY'):
     """
-    Track equal-weighted or weighted portfolio from start_date to end_date.
+    Track weighted portfolio from start_date to end_date.
     Returns cumulative returns for portfolio and benchmark.
     """
     if end_date is None:
@@ -425,15 +436,13 @@ if 'data_loaded_today' not in st.session_state:
 # Load data for today's screener
 if st.sidebar.button("Load/Refresh Today's Data"):
     with st.spinner("Downloading financial data for all S&P 500 stocks..."):
-        today_data = load_all_data_as_of(datetime.now(), tickers)
+        today_data = load_all_data_as_of(datetime.now(), tickers, min_years)
         st.session_state.today_data = today_data
         st.session_state.data_loaded_today = True
     st.success("Today's data loaded successfully!")
 
 if not st.session_state.data_loaded_today:
     st.info("Click 'Load/Refresh Today's Data' to start the screener.")
-    # We still allow the backtest page to load its own data as needed.
-    # But we need the tickers list anyway.
 
 # ------------------------------------------------------------
 # PAGE 1: Screener (using today's data)
@@ -464,7 +473,7 @@ if page == "Screener (Today)":
                 mime='text/csv',
             )
 
-            # Portfolio Builder (same as before, using today's data)
+            # Portfolio Builder (using today's data)
             st.markdown("---")
             st.subheader("📊 Build Optimal Risky Portfolio from Passing Stocks")
             st.markdown("Select stocks from the list below to construct the tangency portfolio (maximum Sharpe ratio).")
@@ -555,12 +564,20 @@ else:  # Historical Backtest
     portfolio_type = st.radio("Portfolio weighting", ["Equal‑weighted", "Optimal (tangency)"])
 
     if st.button("Run Historical Backtest"):
-        # 1. Load fundamentals as of start_date
+        # 1. Load fundamentals as of start_date, using the current min_years from slider
         cutoff = pd.to_datetime(start_date)
         with st.spinner(f"Loading financial data as of {cutoff.strftime('%Y-%m-%d')}..."):
-            hist_data = load_all_data_as_of(cutoff, tickers)
+            hist_data = load_all_data_as_of(cutoff, tickers, min_years)
+
         if hist_data.empty:
-            st.error("No fundamental data available for that date. Try a later date.")
+            st.error(f"""
+            ❌ **No stocks passed the screen as of {cutoff.strftime('%Y-%m-%d')}.**
+            Possible reasons:
+            - Not enough years of financial data available (requires at least **{min_years}** years).
+            - The filters are too strict for that period.
+            - The date is too early (try after **2020‑01‑01**).
+            - Reduce the **"Minimum years of data"** slider in the sidebar and try again.
+            """)
             st.stop()
 
         # 2. Apply screens
