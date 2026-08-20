@@ -7,17 +7,20 @@ import io
 import time
 import warnings
 from scipy.optimize import minimize
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import plotly.express as px
 warnings.filterwarnings('ignore')
 
 # ------------------------------------------------------------
 # Page config
 # ------------------------------------------------------------
 st.set_page_config(page_title="Buffett Stock Screener", layout="wide")
-st.title("📈 Buffett‑Style Stock Screener")
-st.markdown("""
-This app screens S&P 500 stocks using quantitative proxies for Warren Buffett’s principles.  
-Adjust the filters in the sidebar to see which companies match your criteria.
-""")
+
+# Sidebar navigation
+page = st.sidebar.radio("📂 Select Page", ["Screener", "Backtest"])
+
+st.sidebar.markdown("---")
 
 # ------------------------------------------------------------
 # Fetch S&P 500 tickers
@@ -47,7 +50,7 @@ def get_sp500_tickers():
     return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'JNJ', 'V', 'PG', 'UNH', 'KO']
 
 # ------------------------------------------------------------
-# Data fetching and metric computation
+# Data fetching and metric computation (unchanged)
 # ------------------------------------------------------------
 def get_metrics_for_ticker(ticker_symbol):
     """
@@ -64,7 +67,6 @@ def get_metrics_for_ticker(ticker_symbol):
     except:
         return None
 
-    # Map fiscal year to column
     def year_map(df):
         mapping = {}
         for col in df.columns:
@@ -109,14 +111,12 @@ def get_metrics_for_ticker(ticker_symbol):
         capex_raw = get_item(cashflow, cashflow_years, ['Capital Expenditure', 'Capital Expenditures', 'Purchase Of Property Plant And Equipment'])
         capex = abs(capex_raw) if pd.notna(capex_raw) else np.nan
 
-        # Revenue growth
         if prev_revenue is not None and pd.notna(prev_revenue) and pd.notna(revenue) and prev_revenue != 0:
             rev_growth = (revenue / prev_revenue - 1) * 100
         else:
             rev_growth = np.nan
         prev_revenue = revenue
 
-        # Ratios
         gross_margin = (gross_profit / revenue * 100) if pd.notna(gross_profit) and pd.notna(revenue) and revenue != 0 else np.nan
         op_margin = (operating_income / revenue * 100) if pd.notna(operating_income) and pd.notna(revenue) and revenue != 0 else np.nan
         roe = (net_income / equity * 100) if pd.notna(net_income) and pd.notna(equity) and equity != 0 else np.nan
@@ -136,25 +136,16 @@ def get_metrics_for_ticker(ticker_symbol):
         })
     return pd.DataFrame(rows)
 
-# ------------------------------------------------------------
-# Load all ticker data and compute summary metrics
-# ------------------------------------------------------------
 @st.cache_data(ttl=3600*24, show_spinner=False)
 def load_all_data(tickers):
-    """
-    Download fundamentals for all tickers, compute per‑ticker summary metrics,
-    and return a DataFrame.
-    """
     summaries = []
     failed = []
     progress_bar = st.progress(0, text="Downloading data...")
     total = len(tickers)
-
     for i, sym in enumerate(tickers):
         try:
             df = get_metrics_for_ticker(sym)
-            if df is not None and len(df) >= 4:   # require at least 4 years
-                # Compute summary metrics
+            if df is not None and len(df) >= 4:
                 summary = {
                     'Ticker': sym,
                     'Years': len(df),
@@ -168,9 +159,8 @@ def load_all_data(tickers):
                     'Rev Growth Positive Count': (df['Revenue Growth (%)'] > 0).sum(),
                     'Latest FCF': df.iloc[-1]['FCF'],
                 }
-                # Get company name and valuation
                 t = yf.Ticker(sym)
-                name = sym  # fallback to ticker
+                name = sym
                 try:
                     info = t.info
                     name = info.get('longName') or info.get('shortName') or sym
@@ -197,81 +187,53 @@ def load_all_data(tickers):
                 summaries.append(summary)
             else:
                 failed.append(sym)
-        except Exception as e:
+        except:
             failed.append(sym)
-        # Update progress
         progress_bar.progress((i+1)/total, text=f"Processing {sym} ({i+1}/{total})")
-        time.sleep(1)   # to avoid rate limits
-
+        time.sleep(1)
     progress_bar.empty()
     if failed:
         st.warning(f"Failed to retrieve data for {len(failed)} tickers.")
     return pd.DataFrame(summaries)
 
 # ------------------------------------------------------------
-# Portfolio optimization functions
+# Portfolio optimization functions (for Screener page)
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_historical_prices(tickers, period="5y"):
     """Fetch adjusted close prices for given tickers."""
     data = yf.download(tickers, period=period, group_by='ticker', auto_adjust=True, progress=False)
-    # If only one ticker, adjust format
     if len(tickers) == 1:
-        prices = data['Close'] if 'Close' in data else data
+        if isinstance(data, pd.Series):
+            return data.to_frame('Close')
+        if 'Close' in data:
+            prices = data['Close']
+        else:
+            prices = data
     else:
         prices = pd.DataFrame({ticker: data[ticker]['Close'] for ticker in tickers if ticker in data.columns})
     return prices
 
 def portfolio_stats(weights, mean_returns, cov_matrix):
-    """Compute expected return, volatility, and Sharpe ratio."""
-    ret = np.sum(mean_returns * weights) * 252   # annualized
-    vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))  # annualized
+    ret = np.sum(mean_returns * weights) * 252
+    vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))
     return ret, vol
 
-def tangency_portfolio(mean_returns, cov_matrix, risk_free_rate=0.02):
-    """Compute tangency (maximum Sharpe) portfolio weights."""
-    n = len(mean_returns)
-    inv_cov = np.linalg.pinv(cov_matrix)  # use pseudo-inverse for stability
-    ones = np.ones(n)
-    mu_minus_rf = mean_returns - risk_free_rate
-    numerator = inv_cov @ mu_minus_rf
-    denominator = ones @ numerator
-    if denominator == 0:
-        return None
-    weights = numerator / denominator
-    # Clip small negative weights to zero and renormalize? 
-    # We'll allow short sales? Better to constrain to long-only.
-    # We'll use a constrained optimization for long-only to be safe.
-    # Since we want long-only, we'll use scipy minimize with bounds.
-    # Use the analytical solution as initial guess.
-    return weights
-
 def optimize_portfolio(tickers, risk_free_rate=0.02, period="5y"):
-    """
-    Fetch historical data, compute mean returns and covariance, 
-    and return tangency portfolio weights and stats.
-    """
     prices = fetch_historical_prices(tickers, period)
     if prices.empty or len(prices) < 2:
         return None, None, None
-    
-    # Compute daily returns
     returns = prices.pct_change().dropna()
     if returns.shape[0] < 10:
         return None, None, None
-    
     mean_returns = returns.mean().values
     cov_matrix = returns.cov().values
-    
-    # Use scipy optimize for long-only tangency portfolio
     n = len(tickers)
-    # Objective: minimize negative Sharpe (or maximize Sharpe)
     def neg_sharpe(w):
         ret = np.sum(mean_returns * w) * 252
         vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix * 252, w)))
         sharpe = (ret - risk_free_rate) / vol if vol > 0 else 0
         return -sharpe
-    
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
     bounds = tuple((0, 1) for _ in range(n))
     initial = np.ones(n) / n
@@ -284,7 +246,80 @@ def optimize_portfolio(tickers, risk_free_rate=0.02, period="5y"):
     return weights, ret_ann, vol_ann, sharpe
 
 # ------------------------------------------------------------
-# Sidebar parameters
+# Backtest function
+# ------------------------------------------------------------
+@st.cache_data(ttl=3600)
+def get_backtest_performance(tickers, start_date, end_date, benchmark_ticker='SPY'):
+    """Fetch prices, compute equal-weighted portfolio returns and benchmark returns."""
+    # Ensure start_date and end_date are datetime
+    if isinstance(start_date, str):
+        start_date = pd.to_datetime(start_date)
+    if isinstance(end_date, str):
+        end_date = pd.to_datetime(end_date)
+    
+    # Get prices for all tickers plus benchmark
+    all_tickers = list(set(tickers + [benchmark_ticker]))
+    try:
+        # We'll download for the full period
+        data = yf.download(all_tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
+        if data.empty:
+            return None, None, None, None, None
+        # If data is multi-index, extract close
+        if 'Close' in data.columns:
+            prices = data['Close']
+        else:
+            prices = data
+    except:
+        return None, None, None, None, None
+
+    # Filter to only the tickers we need (some may have missing data)
+    available_tickers = [t for t in tickers if t in prices.columns]
+    if len(available_tickers) == 0:
+        return None, None, None, None, None
+    # Keep only tickers with full data (no NaNs)
+    valid_tickers = []
+    for t in available_tickers:
+        if prices[t].notna().all():
+            valid_tickers.append(t)
+    if len(valid_tickers) == 0:
+        return None, None, None, None, None
+    
+    # Compute equal-weighted portfolio daily returns
+    port_returns = prices[valid_tickers].pct_change().mean(axis=1)
+    port_returns = port_returns.dropna()
+    # Benchmark returns
+    if benchmark_ticker in prices.columns:
+        bench_returns = prices[benchmark_ticker].pct_change().dropna()
+        # Align dates
+        common_dates = port_returns.index.intersection(bench_returns.index)
+        port_returns = port_returns.loc[common_dates]
+        bench_returns = bench_returns.loc[common_dates]
+    else:
+        bench_returns = None
+
+    # Cumulative returns
+    port_cum = (1 + port_returns).cumprod()
+    bench_cum = (1 + bench_returns).cumprod() if bench_returns is not None else None
+
+    # Compute metrics
+    total_return = port_cum.iloc[-1] - 1 if len(port_cum) > 0 else np.nan
+    # Annualized return (based on actual number of days)
+    days = (port_cum.index[-1] - port_cum.index[0]).days
+    if days > 0:
+        ann_return = (1 + total_return) ** (365.25 / days) - 1
+    else:
+        ann_return = np.nan
+    vol = port_returns.std() * np.sqrt(252)
+    sharpe = (ann_return - risk_free_rate) / vol if vol > 0 else np.nan
+    # Max drawdown
+    peak = port_cum.expanding().max()
+    drawdown = (port_cum - peak) / peak
+    max_dd = drawdown.min() if len(drawdown) > 0 else np.nan
+
+    return port_cum, bench_cum, valid_tickers, ann_return, vol, sharpe, max_dd, total_return
+
+# ------------------------------------------------------------
+# Sidebar parameters (shared across pages)
 # ------------------------------------------------------------
 st.sidebar.header("Screening Parameters")
 
@@ -305,16 +340,15 @@ pb_max = st.sidebar.slider("P/B maximum", 1, 30, 8, 1)
 pfcf_max = st.sidebar.slider("P/FCF maximum", 5, 100, 40, 1)
 market_cap_min = st.sidebar.number_input("Minimum Market Cap ($B)", value=10.0, step=1.0)
 
-# ------------------------------------------------------------
-# Portfolio optimization UI settings (in sidebar)
-# ------------------------------------------------------------
-st.sidebar.markdown("---")
-st.sidebar.subheader("Portfolio Optimization")
+# Portfolio optimization settings (only used in Screener page)
 risk_free_rate = st.sidebar.number_input("Risk‑free rate (annual, %)", value=2.0, step=0.1) / 100
 period_opt = st.sidebar.selectbox("Historical data period", ["1y", "2y", "3y", "5y", "10y"], index=3)
 
+st.sidebar.markdown("---")
+st.sidebar.caption("All parameters apply to both pages.")
+
 # ------------------------------------------------------------
-# Main logic
+# Main logic: load data and render page
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_tickers_cached():
@@ -325,30 +359,44 @@ tickers = get_tickers_cached()
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
 
-if st.button("Load/Refresh Data"):
+# Load data button (always visible)
+if st.sidebar.button("Load/Refresh Data"):
     with st.spinner("Downloading financial data for all S&P 500 stocks... This may take 10–20 minutes."):
         data = load_all_data(tickers)
         st.session_state.data = data
         st.session_state.data_loaded = True
     st.success("Data loaded successfully!")
 
-if st.session_state.data_loaded:
-    data = st.session_state.data
+if not st.session_state.data_loaded:
+    st.info("Click the 'Load/Refresh Data' button to start. The initial download may take a while.")
+    st.stop()
 
-    # Apply filters
-    passing = data[
-        (data['Years'] >= min_years) &
-        (data['Avg Gross Margin (%)'] > gross_margin_min) &
-        (data['Avg Op Margin (%)'] > op_margin_min) &
-        (data['Avg ROE (%)'] > roe_min) &
-        (data['Avg Debt/Equity'] < de_max) &
-        (data['FCF Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
-        (data['Rev Growth Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
-        (data['P/E'] > 0) & (data['P/E'] < pe_max) &
-        (data['P/B'] < pb_max) &
-        (data['P/FCF'] < pfcf_max) &
-        (data['Market Cap ($B)'] > market_cap_min)
-    ]
+data = st.session_state.data
+
+# Apply common filter to get passing stocks
+passing = data[
+    (data['Years'] >= min_years) &
+    (data['Avg Gross Margin (%)'] > gross_margin_min) &
+    (data['Avg Op Margin (%)'] > op_margin_min) &
+    (data['Avg ROE (%)'] > roe_min) &
+    (data['Avg Debt/Equity'] < de_max) &
+    (data['FCF Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
+    (data['Rev Growth Positive Count'] >= np.ceil(pass_ratio * data['Years'])) &
+    (data['P/E'] > 0) & (data['P/E'] < pe_max) &
+    (data['P/B'] < pb_max) &
+    (data['P/FCF'] < pfcf_max) &
+    (data['Market Cap ($B)'] > market_cap_min)
+]
+
+# ------------------------------------------------------------
+# PAGE 1: Screener
+# ------------------------------------------------------------
+if page == "Screener":
+    st.title("📈 Buffett‑Style Stock Screener")
+    st.markdown("""
+    This app screens S&P 500 stocks using quantitative proxies for Warren Buffett’s principles.  
+    Adjust the filters in the sidebar to see which companies match your criteria.
+    """)
 
     st.subheader(f"Results: {len(passing)} passing stocks")
     if not passing.empty:
@@ -364,19 +412,15 @@ if st.session_state.data_loaded:
             mime='text/csv',
         )
 
-        # ------------------------------------------------------------
-        # Portfolio Builder Section
-        # ------------------------------------------------------------
+        # Portfolio Builder
         st.markdown("---")
         st.subheader("📊 Build Optimal Risky Portfolio from Passing Stocks")
         st.markdown("Select stocks from the list below to construct the tangency portfolio (maximum Sharpe ratio).")
 
-        # Get list of tickers and names
         ticker_list = passing['Ticker'].tolist()
         name_list = passing['Name'].tolist()
         options = [f"{ticker} - {name}" for ticker, name in zip(ticker_list, name_list)]
-        default_selection = options[:min(10, len(options))]  # default to first 10
-
+        default_selection = options[:min(10, len(options))]
         selected_options = st.multiselect("Choose stocks for portfolio (at least 2)", options, default=default_selection)
         selected_tickers = [opt.split(" - ")[0] for opt in selected_options]
 
@@ -387,15 +431,13 @@ if st.session_state.data_loaded:
                 with st.spinner("Fetching historical data and optimizing..."):
                     weights, ret, vol, sharpe = optimize_portfolio(selected_tickers, risk_free_rate, period_opt)
                     if weights is not None:
-                        # Create results DataFrame
                         weight_df = pd.DataFrame({
                             'Ticker': selected_tickers,
                             'Weight (%)': weights * 100
                         })
-                        # Add company names if available
                         name_map = {ticker: name for ticker, name in zip(ticker_list, name_list)}
                         weight_df['Name'] = weight_df['Ticker'].map(name_map)
-                        weight_df = weight_df[weight_df['Weight (%)'] > 0.01]  # drop near-zero weights
+                        weight_df = weight_df[weight_df['Weight (%)'] > 0.01]
                         weight_df = weight_df.sort_values('Weight (%)', ascending=False).reset_index(drop=True)
 
                         st.success("Portfolio optimized!")
@@ -405,16 +447,12 @@ if st.session_state.data_loaded:
                         col3.metric("Sharpe Ratio", f"{sharpe:.3f}")
                         col4.metric("Number of Stocks", len(weight_df))
 
-                        # Display weights
                         st.subheader("Optimal Weights")
                         st.dataframe(weight_df.style.format({'Weight (%)': '{:.2f}'}), use_container_width=True)
 
-                        # Simple pie chart using st.bar_chart? But better to use plotly if available.
-                        # We'll use a simple bar chart.
                         st.subheader("Weight Distribution")
                         st.bar_chart(weight_df.set_index('Ticker')['Weight (%)'])
 
-                        # Description
                         st.subheader("📝 Portfolio Description")
                         desc = f"""
                         This **optimal risky portfolio** (tangency portfolio) is constructed from the {len(weight_df)} stocks 
@@ -431,7 +469,6 @@ if st.session_state.data_loaded:
                         """
                         st.markdown(desc)
 
-                        # Download portfolio weights CSV
                         csv_port = weight_df.to_csv(index=False).encode('utf-8')
                         st.download_button(
                             label="Download portfolio weights as CSV",
@@ -443,5 +480,123 @@ if st.session_state.data_loaded:
                         st.error("Optimization failed. Try selecting a longer history period or a different set of stocks.")
     else:
         st.info("No stocks match the current criteria. Try relaxing the filters.")
-else:
-    st.info("Click the 'Load/Refresh Data' button to start the screen. The initial download may take a while.")
+
+# ------------------------------------------------------------
+# PAGE 2: Backtest
+# ------------------------------------------------------------
+else:  # Backtest page
+    st.title("⏳ Backtest the Screen")
+    st.markdown("""
+    Select a **past start date** and a **horizon** to see how the stocks that pass today's screen would have performed over that period.  
+    The portfolio is **equal‑weighted** across all passing stocks.
+    """)
+
+    # Backtest UI
+    col1, col2 = st.columns(2)
+    with col1:
+        # Default start date: 1 year ago
+        default_start = datetime.now() - timedelta(days=365)
+        start_date = st.date_input("Start date", default_start, max_value=datetime.now() - timedelta(days=1))
+    with col2:
+        horizon_options = {
+            "1 Month": 30,
+            "3 Months": 90,
+            "6 Months": 180,
+            "1 Year": 365,
+            "2 Years": 730,
+            "5 Years": 1825
+        }
+        horizon_label = st.selectbox("Horizon", list(horizon_options.keys()), index=3)  # default 1 Year
+        horizon_days = horizon_options[horizon_label]
+        # Compute end date automatically from start + horizon
+        end_date = pd.to_datetime(start_date) + timedelta(days=horizon_days)
+        # But we cannot go beyond today; cap at today
+        today = datetime.now()
+        if end_date > today:
+            end_date = today
+        st.write(f"End date: **{end_date.strftime('%Y-%m-%d')}** (capped at today)")
+
+    # Get the tickers that pass the screen
+    if passing.empty:
+        st.warning("No stocks pass the current screen. Adjust the parameters to get some stocks.")
+        st.stop()
+
+    ticker_list = passing['Ticker'].tolist()
+    name_map = dict(zip(passing['Ticker'], passing['Name']))
+
+    st.info(f"Using **{len(ticker_list)}** stocks that pass the current screen.")
+
+    if st.button("Run Backtest"):
+        with st.spinner("Fetching historical prices and computing performance..."):
+            # Run backtest
+            port_cum, bench_cum, valid_tickers, ann_return, vol, sharpe, max_dd, total_return = get_backtest_performance(
+                ticker_list, start_date, end_date
+            )
+
+            if port_cum is None or len(port_cum) == 0:
+                st.error("Not enough price data for the selected period. Try a shorter period or different start date.")
+            else:
+                # Prepare data for chart
+                # If benchmark is None, we skip it
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=port_cum.index,
+                    y=port_cum,
+                    mode='lines',
+                    name='Equal-Weighted Portfolio',
+                    line=dict(color='blue')
+                ))
+                if bench_cum is not None and len(bench_cum) > 0:
+                    # Align benchmark to portfolio dates
+                    common_idx = port_cum.index.intersection(bench_cum.index)
+                    if len(common_idx) > 0:
+                        bench_cum_aligned = bench_cum.loc[common_idx]
+                        fig.add_trace(go.Scatter(
+                            x=common_idx,
+                            y=bench_cum_aligned,
+                            mode='lines',
+                            name='S&P 500 (SPY)',
+                            line=dict(color='red', dash='dash')
+                        ))
+                fig.update_layout(
+                    title='Cumulative Return',
+                    xaxis_title='Date',
+                    yaxis_title='Cumulative Return (starting at 1)',
+                    hovermode='x unified',
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Metrics
+                st.subheader("Performance Metrics")
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Total Return", f"{total_return*100:.2f}%")
+                col2.metric("Annualized Return", f"{ann_return*100:.2f}%")
+                col3.metric("Volatility (ann.)", f"{vol*100:.2f}%")
+                col4.metric("Sharpe Ratio", f"{sharpe:.3f}")
+                col5.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+
+                st.subheader("Stocks Included in Backtest")
+                st.write(f"Out of {len(ticker_list)} passing stocks, **{len(valid_tickers)}** had complete price data for the period.")
+                st.dataframe(pd.DataFrame({'Ticker': valid_tickers, 'Name': [name_map.get(t, t) for t in valid_tickers]}))
+
+                # Interpretation
+                st.subheader("📝 Interpretation")
+                if bench_cum is not None:
+                    bench_total = bench_cum_aligned.iloc[-1] - 1 if len(bench_cum_aligned) > 0 else np.nan
+                    outperformance = total_return - bench_total if pd.notna(bench_total) else np.nan
+                    if pd.notna(outperformance) and outperformance > 0:
+                        outperf_str = f"outperformed the S&P 500 by **{outperformance*100:.2f}%**"
+                    elif pd.notna(outperformance):
+                        outperf_str = f"underperformed the S&P 500 by **{-outperformance*100:.2f}%**"
+                    else:
+                        outperf_str = "could not be compared to the benchmark."
+                else:
+                    outperf_str = "benchmark data not available."
+                st.markdown(f"""
+                Over the period from **{start_date.strftime('%Y-%m-%d')}** to **{end_date.strftime('%Y-%m-%d')}**,
+                the equal‑weighted portfolio of Buffett‑screened stocks returned **{total_return*100:.2f}%** 
+                (annualized: **{ann_return*100:.2f}%**).  
+                It {outperf_str}  
+                The portfolio had an annualized volatility of **{vol*100:.2f}%** and a maximum drawdown of **{max_dd*100:.2f}%**.
+                """)
