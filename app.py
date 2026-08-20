@@ -246,51 +246,47 @@ def optimize_portfolio(tickers, risk_free_rate=0.02, period="5y"):
     return weights, ret_ann, vol_ann, sharpe
 
 # ------------------------------------------------------------
-# Backtest function
+# Backtest function (revised for multi‑horizon)
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def get_backtest_performance(tickers, start_date, end_date, benchmark_ticker='SPY'):
-    """Fetch prices, compute equal-weighted portfolio returns and benchmark returns."""
-    # Ensure start_date and end_date are datetime
+def get_backtest_data(tickers, start_date, end_date=None, benchmark_ticker='SPY'):
+    """
+    Fetch price data for the given tickers from start_date to end_date.
+    Returns a DataFrame of cumulative returns for the equal‑weighted portfolio
+    and the benchmark, aligned on common dates.
+    """
+    if end_date is None:
+        end_date = datetime.now()
+    # Ensure datetime
     if isinstance(start_date, str):
         start_date = pd.to_datetime(start_date)
     if isinstance(end_date, str):
         end_date = pd.to_datetime(end_date)
-    
-    # Get prices for all tickers plus benchmark
+    # Add a buffer to get complete data
     all_tickers = list(set(tickers + [benchmark_ticker]))
     try:
-        # We'll download for the full period
         data = yf.download(all_tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
         if data.empty:
-            return None, None, None, None, None
-        # If data is multi-index, extract close
+            return None, None
         if 'Close' in data.columns:
             prices = data['Close']
         else:
             prices = data
     except:
-        return None, None, None, None, None
+        return None, None
 
-    # Filter to only the tickers we need (some may have missing data)
-    available_tickers = [t for t in tickers if t in prices.columns]
-    if len(available_tickers) == 0:
-        return None, None, None, None, None
-    # Keep only tickers with full data (no NaNs)
+    # Filter tickers with full data
     valid_tickers = []
-    for t in available_tickers:
-        if prices[t].notna().all():
+    for t in tickers:
+        if t in prices.columns and prices[t].notna().all():
             valid_tickers.append(t)
     if len(valid_tickers) == 0:
-        return None, None, None, None, None
-    
-    # Compute equal-weighted portfolio daily returns
-    port_returns = prices[valid_tickers].pct_change().mean(axis=1)
-    port_returns = port_returns.dropna()
-    # Benchmark returns
+        return None, None
+    # Portfolio daily returns (equal-weighted)
+    port_returns = prices[valid_tickers].pct_change().mean(axis=1).dropna()
+    # Benchmark
     if benchmark_ticker in prices.columns:
         bench_returns = prices[benchmark_ticker].pct_change().dropna()
-        # Align dates
         common_dates = port_returns.index.intersection(bench_returns.index)
         port_returns = port_returns.loc[common_dates]
         bench_returns = bench_returns.loc[common_dates]
@@ -301,22 +297,44 @@ def get_backtest_performance(tickers, start_date, end_date, benchmark_ticker='SP
     port_cum = (1 + port_returns).cumprod()
     bench_cum = (1 + bench_returns).cumprod() if bench_returns is not None else None
 
-    # Compute metrics
-    total_return = port_cum.iloc[-1] - 1 if len(port_cum) > 0 else np.nan
-    # Annualized return (based on actual number of days)
-    days = (port_cum.index[-1] - port_cum.index[0]).days
-    if days > 0:
-        ann_return = (1 + total_return) ** (365.25 / days) - 1
-    else:
-        ann_return = np.nan
-    vol = port_returns.std() * np.sqrt(252)
-    sharpe = (ann_return - risk_free_rate) / vol if vol > 0 else np.nan
-    # Max drawdown
-    peak = port_cum.expanding().max()
-    drawdown = (port_cum - peak) / peak
-    max_dd = drawdown.min() if len(drawdown) > 0 else np.nan
+    return port_cum, bench_cum, valid_tickers
 
-    return port_cum, bench_cum, valid_tickers, ann_return, vol, sharpe, max_dd, total_return
+def compute_horizon_returns(port_cum, bench_cum, start_date, end_date):
+    """
+    Given cumulative series, compute total return for a specific period
+    by indexing at start and end dates.
+    """
+    # If port_cum is empty, return NaN
+    if port_cum.empty:
+        return np.nan, np.nan
+    # Align start and end within the series date range
+    # Get the closest available dates (we'll use actual trading days)
+    # We'll find the nearest date <= end_date and >= start_date
+    port_idx = port_cum.index
+    # Find indices
+    start_mask = port_idx >= start_date
+    if not start_mask.any():
+        return np.nan, np.nan
+    start_idx = port_idx[start_mask].min()
+    end_mask = port_idx <= end_date
+    if not end_mask.any():
+        return np.nan, np.nan
+    end_idx = port_idx[end_mask].max()
+    if start_idx > end_idx:
+        return np.nan, np.nan
+    port_ret = port_cum.loc[end_idx] / port_cum.loc[start_idx] - 1
+    if bench_cum is not None and not bench_cum.empty:
+        bench_idx = bench_cum.index
+        # Use the same dates if available, else the nearest
+        b_start = bench_idx[bench_idx >= start_idx].min() if (bench_idx >= start_idx).any() else None
+        b_end = bench_idx[bench_idx <= end_idx].max() if (bench_idx <= end_idx).any() else None
+        if b_start is not None and b_end is not None and b_start <= b_end:
+            bench_ret = bench_cum.loc[b_end] / bench_cum.loc[b_start] - 1
+        else:
+            bench_ret = np.nan
+    else:
+        bench_ret = np.nan
+    return port_ret, bench_ret
 
 # ------------------------------------------------------------
 # Sidebar parameters (shared across pages)
@@ -482,39 +500,18 @@ if page == "Screener":
         st.info("No stocks match the current criteria. Try relaxing the filters.")
 
 # ------------------------------------------------------------
-# PAGE 2: Backtest
+# PAGE 2: Backtest (multi‑horizon)
 # ------------------------------------------------------------
 else:  # Backtest page
     st.title("⏳ Backtest the Screen")
     st.markdown("""
-    Select a **past start date** and a **horizon** to see how the stocks that pass today's screen would have performed over that period.  
-    The portfolio is **equal‑weighted** across all passing stocks.
+    Select a **past start date** – the app will compute returns for **1‑month, 3‑month, 6‑month, 1‑year, 2‑year, and 5‑year** horizons (as far as data allows).  
+    The portfolio is **equal‑weighted** across all stocks that pass today's screen.
     """)
 
     # Backtest UI
-    col1, col2 = st.columns(2)
-    with col1:
-        # Default start date: 1 year ago
-        default_start = datetime.now() - timedelta(days=365)
-        start_date = st.date_input("Start date", default_start, max_value=datetime.now() - timedelta(days=1))
-    with col2:
-        horizon_options = {
-            "1 Month": 30,
-            "3 Months": 90,
-            "6 Months": 180,
-            "1 Year": 365,
-            "2 Years": 730,
-            "5 Years": 1825
-        }
-        horizon_label = st.selectbox("Horizon", list(horizon_options.keys()), index=3)  # default 1 Year
-        horizon_days = horizon_options[horizon_label]
-        # Compute end date automatically from start + horizon
-        end_date = pd.to_datetime(start_date) + timedelta(days=horizon_days)
-        # But we cannot go beyond today; cap at today
-        today = datetime.now()
-        if end_date > today:
-            end_date = today
-        st.write(f"End date: **{end_date.strftime('%Y-%m-%d')}** (capped at today)")
+    default_start = datetime.now() - timedelta(days=365)
+    start_date = st.date_input("Start date", default_start, max_value=datetime.now() - timedelta(days=1))
 
     # Get the tickers that pass the screen
     if passing.empty:
@@ -523,80 +520,125 @@ else:  # Backtest page
 
     ticker_list = passing['Ticker'].tolist()
     name_map = dict(zip(passing['Ticker'], passing['Name']))
-
     st.info(f"Using **{len(ticker_list)}** stocks that pass the current screen.")
 
     if st.button("Run Backtest"):
-        with st.spinner("Fetching historical prices and computing performance..."):
-            # Run backtest
-            port_cum, bench_cum, valid_tickers, ann_return, vol, sharpe, max_dd, total_return = get_backtest_performance(
-                ticker_list, start_date, end_date
-            )
-
-            if port_cum is None or len(port_cum) == 0:
-                st.error("Not enough price data for the selected period. Try a shorter period or different start date.")
+        with st.spinner("Fetching historical prices and computing returns for all horizons..."):
+            # Fetch data from start date to today
+            end_date = datetime.now()
+            port_cum, bench_cum, valid_tickers = get_backtest_data(ticker_list, start_date, end_date)
+            if port_cum is None or port_cum.empty:
+                st.error("No price data available for the selected start date. Try a later date.")
             else:
-                # Prepare data for chart
-                # If benchmark is None, we skip it
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
+                # Define horizons in days
+                horizons = {
+                    "1 Month": 30,
+                    "3 Months": 90,
+                    "6 Months": 180,
+                    "1 Year": 365,
+                    "2 Years": 730,
+                    "5 Years": 1825
+                }
+                results = []
+                # For each horizon, compute return from start_date to start_date + horizon
+                for label, days in horizons.items():
+                    horizon_end = start_date + timedelta(days=days)
+                    # Cap at end_date (today) if horizon extends beyond
+                    if horizon_end > end_date:
+                        horizon_end = end_date
+                    port_ret, bench_ret = compute_horizon_returns(port_cum, bench_cum, start_date, horizon_end)
+                    results.append({
+                        'Horizon': label,
+                        'Portfolio Return (%)': port_ret * 100 if pd.notna(port_ret) else np.nan,
+                        'S&P 500 Return (%)': bench_ret * 100 if pd.notna(bench_ret) else np.nan,
+                        'Outperformance (%)': (port_ret - bench_ret) * 100 if pd.notna(port_ret) and pd.notna(bench_ret) else np.nan
+                    })
+                results_df = pd.DataFrame(results)
+
+                # Display table
+                st.subheader("Returns by Horizon")
+                st.dataframe(results_df.style.format('{:.2f}'), use_container_width=True)
+
+                # Bar chart
+                fig_bar = go.Figure()
+                fig_bar.add_trace(go.Bar(
+                    x=results_df['Horizon'],
+                    y=results_df['Portfolio Return (%)'],
+                    name='Portfolio',
+                    marker_color='blue'
+                ))
+                fig_bar.add_trace(go.Bar(
+                    x=results_df['Horizon'],
+                    y=results_df['S&P 500 Return (%)'],
+                    name='S&P 500',
+                    marker_color='red'
+                ))
+                fig_bar.update_layout(
+                    title='Return Comparison per Horizon',
+                    xaxis_title='Horizon',
+                    yaxis_title='Return (%)',
+                    barmode='group',
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+                # Cumulative chart from start to today (or longest available)
+                st.subheader("Cumulative Performance")
+                # Plot only if we have at least some data
+                fig_cum = go.Figure()
+                fig_cum.add_trace(go.Scatter(
                     x=port_cum.index,
                     y=port_cum,
                     mode='lines',
-                    name='Equal-Weighted Portfolio',
+                    name='Portfolio (equal‑weight)',
                     line=dict(color='blue')
                 ))
-                if bench_cum is not None and len(bench_cum) > 0:
-                    # Align benchmark to portfolio dates
+                if bench_cum is not None and not bench_cum.empty:
                     common_idx = port_cum.index.intersection(bench_cum.index)
                     if len(common_idx) > 0:
                         bench_cum_aligned = bench_cum.loc[common_idx]
-                        fig.add_trace(go.Scatter(
+                        fig_cum.add_trace(go.Scatter(
                             x=common_idx,
                             y=bench_cum_aligned,
                             mode='lines',
                             name='S&P 500 (SPY)',
                             line=dict(color='red', dash='dash')
                         ))
-                fig.update_layout(
-                    title='Cumulative Return',
+                # Add vertical lines for each horizon end (only if within data range)
+                for label, days in horizons.items():
+                    horizon_end = start_date + timedelta(days=days)
+                    if horizon_end > end_date:
+                        horizon_end = end_date
+                    if horizon_end in port_cum.index or (horizon_end < port_cum.index[-1] and horizon_end > port_cum.index[0]):
+                        # find nearest date
+                        nearest = port_cum.index[port_cum.index <= horizon_end].max()
+                        if pd.notna(nearest):
+                            fig_cum.add_vline(x=nearest, line_width=1, line_dash="dash", line_color="grey", annotation_text=label, annotation_position="top")
+                fig_cum.update_layout(
+                    title=f'Cumulative Return from {start_date.strftime("%Y-%m-%d")} to Today',
                     xaxis_title='Date',
                     yaxis_title='Cumulative Return (starting at 1)',
                     hovermode='x unified',
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig_cum, use_container_width=True)
 
-                # Metrics
-                st.subheader("Performance Metrics")
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Total Return", f"{total_return*100:.2f}%")
-                col2.metric("Annualized Return", f"{ann_return*100:.2f}%")
-                col3.metric("Volatility (ann.)", f"{vol*100:.2f}%")
-                col4.metric("Sharpe Ratio", f"{sharpe:.3f}")
-                col5.metric("Max Drawdown", f"{max_dd*100:.2f}%")
-
-                st.subheader("Stocks Included in Backtest")
-                st.write(f"Out of {len(ticker_list)} passing stocks, **{len(valid_tickers)}** had complete price data for the period.")
+                # List of stocks included
+                st.subheader("Stocks Included")
+                st.write(f"Out of {len(ticker_list)} passing stocks, **{len(valid_tickers)}** had complete price data from {start_date.strftime('%Y-%m-%d')} onwards.")
                 st.dataframe(pd.DataFrame({'Ticker': valid_tickers, 'Name': [name_map.get(t, t) for t in valid_tickers]}))
 
                 # Interpretation
-                st.subheader("📝 Interpretation")
-                if bench_cum is not None:
-                    bench_total = bench_cum_aligned.iloc[-1] - 1 if len(bench_cum_aligned) > 0 else np.nan
-                    outperformance = total_return - bench_total if pd.notna(bench_total) else np.nan
-                    if pd.notna(outperformance) and outperformance > 0:
-                        outperf_str = f"outperformed the S&P 500 by **{outperformance*100:.2f}%**"
-                    elif pd.notna(outperformance):
-                        outperf_str = f"underperformed the S&P 500 by **{-outperformance*100:.2f}%**"
-                    else:
-                        outperf_str = "could not be compared to the benchmark."
+                # Find the latest horizon with available data (the one with longest days that has a valid return)
+                latest_valid = results_df[results_df['Portfolio Return (%)'].notna()].iloc[-1] if not results_df[results_df['Portfolio Return (%)'].notna()].empty else None
+                if latest_valid is not None:
+                    last_ret = latest_valid['Portfolio Return (%)']
+                    st.subheader("📝 Interpretation")
+                    st.markdown(f"""
+                    Over the period from **{start_date.strftime('%Y-%m-%d')}** to today, the equal‑weighted portfolio 
+                    of Buffett‑screened stocks has shown a cumulative return of **{last_ret:.2f}%** for the **{latest_valid['Horizon']}** horizon.
+                    The table above shows performance for all shorter horizons, giving you a complete picture of how the 
+                    strategy performed over different time frames.
+                    """)
                 else:
-                    outperf_str = "benchmark data not available."
-                st.markdown(f"""
-                Over the period from **{start_date.strftime('%Y-%m-%d')}** to **{end_date.strftime('%Y-%m-%d')}**,
-                the equal‑weighted portfolio of Buffett‑screened stocks returned **{total_return*100:.2f}%** 
-                (annualized: **{ann_return*100:.2f}%**).  
-                It {outperf_str}  
-                The portfolio had an annualized volatility of **{vol*100:.2f}%** and a maximum drawdown of **{max_dd*100:.2f}%**.
-                """)
+                    st.info("No return data could be computed for any horizon. Try a later start date.")
