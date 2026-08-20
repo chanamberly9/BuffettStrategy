@@ -509,7 +509,7 @@ if page == "Screener (Today)":
                             col4.metric("Number of Stocks", len(weight_df))
 
                             st.subheader("Optimal Weights")
-                            st.dataframe(weight_df.style.format({'Weight (%)': '{:.2f}'}), use_container_width=True)
+                            st.dataframe(weight_df.round(2), use_container_width=True)
 
                             st.subheader("Weight Distribution")
                             st.bar_chart(weight_df.set_index('Ticker')['Weight (%)'])
@@ -612,7 +612,7 @@ else:  # Historical Backtest
                     weight_df['Name'] = weight_df['Ticker'].map(name_map)
                     weight_df = weight_df[weight_df['Weight (%)'] > 0.01].sort_values('Weight (%)', ascending=False)
                     st.subheader("Optimal Weights (as of backtest date)")
-                    st.dataframe(weight_df.style.format({'Weight (%)': '{:.2f}'}), use_container_width=True)
+                    st.dataframe(weight_df.round(2), use_container_width=True)
 
         # 4. Track performance from start_date to today
         with st.spinner("Tracking performance..."):
@@ -626,7 +626,8 @@ else:  # Historical Backtest
 
         # Display results
         st.subheader("Returns by Horizon")
-        st.dataframe(results_df.style.format('{:.2f}'), use_container_width=True)
+        # --- FIX: use round(2) instead of style.format ---
+        st.dataframe(results_df.round(2), use_container_width=True)
 
         # Bar chart
         fig_bar = go.Figure()
